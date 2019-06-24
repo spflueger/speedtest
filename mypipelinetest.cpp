@@ -13,36 +13,43 @@
 
 // defines fundamental data types: double, complex, matrix
 //enum class DataType = {INT, DOUBLE, COMPLEX_DOUBLE}
-/* 
+
 struct Dimension
 {
     size_t Size;
-}
+};
 
-template <typename T>
 struct Tensor
 {
-    std::vector<Dimension> Dimensions; // scalar = 0, vector = 1, matrix = 2
-}
+    virtual ~Tensor() = default;
+    std::vector<Dimension> Dimensions;
+    // size: scalar = 0, vector = 1, matrix = 2
+};
 
 template <typename T>
-struct Scalar : public Tensor<T>
+struct Scalar : public Tensor
 {
+    Scalar(T value) : Value(value) {}
     T Value;
-}
+};
 
 template <typename T>
-struct Vector : public Tensor<T>
+struct Vector : public Tensor
 {
+    Vector() = default;
+    Vector(std::vector<T> values) : Values(values)
+    {
+        Dimensions.push_back({Values.size()});
+    }
     std::vector<T> Values;
-}
+};
 
 // matrix
 template <typename T>
-struct Matrix : public Tensor<T>
+struct Matrix : public Tensor
 {
-    std::vector<std::vector<DataType>> Values;
-}*/
+    std::vector<std::vector<T>> Values;
+};
 
 template <typename T>
 struct Value
@@ -120,19 +127,19 @@ class BinaryOperationFunctor : public OperationStrategy
 {
 public:
     BinaryOperationFunctor(
-        OutputType &output, const InputType1 &input1, const InputType2 &input2, BinaryOperator function)
+        std::shared_ptr<OutputType> output, std::shared_ptr<const InputType1> input1, std::shared_ptr<const InputType2> input2, BinaryOperator function)
         : Input1(input1), Input2(input2), Output(output),
           Function(function) {}
 
     void execute() final
     {
-        Function(Output, Input1, Input2);
+        Function(*Output, *Input1, *Input2);
     }
 
 private:
-    const InputType1 &Input1;
-    const InputType2 &Input2;
-    OutputType &Output;
+    std::shared_ptr<const InputType1> Input1;
+    std::shared_ptr<const InputType2> Input2;
+    std::shared_ptr<OutputType> Output;
     BinaryOperator Function;
 };
 
@@ -142,23 +149,23 @@ struct ElementWiseBinaryOperation
     ElementWiseBinaryOperation(BinaryFunction f) : Function(f){};
 
     template <typename OutputType, typename InputType1, typename InputType2>
-    void operator()(OutputType &Output, const InputType1 &Input1, const InputType2 &Input2)
+    void operator()(Scalar<OutputType> &Output, const Scalar<InputType1> &Input1, const Scalar<InputType2> &Input2)
     {
-        Output = Function(Input1, Input2);
+        Output.Value = Function(Input1.Value, Input2.Value);
     }
 
     template <typename OutputType, typename InputType1, typename InputType2>
-    void operator()(std::vector<OutputType> &Output, const std::vector<InputType1> &Input1, const std::vector<InputType2> &Input2)
+    void operator()(Vector<OutputType> &Output, const Vector<InputType1> &Input1, const Vector<InputType2> &Input2)
     {
-        std::transform(pstl::execution::par_unseq, Input1.begin(), Input1.end(), Input2.begin(),
-                       Output.begin(), Function);
+        std::transform(pstl::execution::par_unseq, Input1.Values.begin(), Input1.Values.end(), Input2.Values.begin(),
+                       Output.Values.begin(), Function);
     }
 
     template <typename OutputType, typename InputType1, typename InputType2>
-    void operator()(std::vector<OutputType> &Output, const std::vector<InputType1> &Input1, const InputType2 &Input2)
+    void operator()(Vector<OutputType> &Output, const Vector<InputType1> &Input1, const Scalar<InputType2> &Input2)
     {
-        std::transform(pstl::execution::par_unseq, Input1.begin(), Input1.end(),
-                       Output.begin(), [&Input2, this](const InputType1 &x) { return Function(x, Input2); });
+        std::transform(pstl::execution::par_unseq, Input1.Values.begin(), Input1.Values.end(),
+                       Output.Values.begin(), [&Input2, this](const InputType1 &x) { return Function(x, Input2.Value); });
     }
 
 private:
@@ -171,18 +178,18 @@ class UnaryOperationFunctor : public OperationStrategy
 {
 public:
     UnaryOperationFunctor(
-        OutputType &output, const InputType &input, UnaryOperator function)
+        std::shared_ptr<OutputType> output, std::shared_ptr<const InputType> input, UnaryOperator function)
         : Input(input), Output(output),
           Function(function) {}
 
     void execute() final
     {
-        Function(Output, Input);
+        Function(*Output, *Input);
     }
 
 private:
-    const InputType &Input;
-    OutputType &Output;
+    std::shared_ptr<const InputType> Input;
+    std::shared_ptr<OutputType> Output;
     UnaryOperator Function;
 };
 
@@ -192,16 +199,16 @@ struct ElementWiseUnaryOperation
     ElementWiseUnaryOperation(UnaryFunction f) : Function(f){};
 
     template <typename OutputType, typename InputType>
-    void operator()(OutputType &Output, const InputType &Input)
+    void operator()(Scalar<OutputType> &Output, const Scalar<InputType> &Input)
     {
-        Output = Function(Input);
+        Output.Value = Function(Input.Value);
     }
 
     template <typename OutputType, typename InputType>
-    void operator()(std::vector<OutputType> &Output, const std::vector<InputType> &Input)
+    void operator()(Vector<OutputType> &Output, const Vector<InputType> &Input)
     {
-        std::transform(pstl::execution::par_unseq, Input.begin(), Input.end(),
-                       Output.begin(), Function);
+        std::transform(pstl::execution::par_unseq, Input.Values.begin(), Input.Values.end(),
+                       Output.Values.begin(), Function);
     }
 
 private:
@@ -292,18 +299,12 @@ public:
     EdgeID
     addBinaryNode(FunctionType Function, EdgeID InputID1, EdgeID InputID2)
     {
-        // first we need to check the input types
-        // if both are scalar, we just use a non-vectorized operation for this and finished
-        // if one of the inputs is a scalar, we need to wrap the operation into a lambda
-        // and call the VectorizedUnaryOperationFunctor using that lambda
-        // example new function = [](VectorInput x){return function(x, ScalarInput);}
-
         EdgeID OutEdgeID = createIntermediateEdge<Output>({InputID1, InputID2});
-        std::cout << "binary size of output container: " << std::any_cast<const Output &>(getDataReference(OutEdgeID)).size() << std::endl;
+        //std::cout << "binary size of output container: " << std::any_cast<const Output &>(getDataReference(OutEdgeID)).size() << std::endl;
         createNewNode(std::make_unique<BinaryOperationFunctor<Output, Input1, Input2, FunctionType>>(
-            std::any_cast<Output &>(getDataReference(OutEdgeID)),
-            std::any_cast<const Input1 &>(getDataReference(InputID1)),
-            std::any_cast<const Input2 &>(getDataReference(InputID2)),
+            getDataReference<Output>(OutEdgeID),
+            getDataReference<const Input1>(InputID1),
+            getDataReference<const Input2>(InputID2),
             Function));
         return OutEdgeID;
     }
@@ -313,11 +314,12 @@ public:
     addUnaryNode(FunctionType Function, EdgeID InputID, bool CacheNode = false)
     {
         EdgeID OutEdgeID = createIntermediateEdge<Output>({InputID});
-        std::cout << "size of input container: " << std::any_cast<const Input &>(getDataReference(InputID)).size() << std::endl;
-        std::cout << "size of output container: " << std::any_cast<const Output &>(getDataReference(OutEdgeID)).size() << std::endl;
+        //std::cout << "size of input container: " << std::any_cast<const Input &>(getDataReference(InputID)).size() << std::endl;
+        //std::cout << "size of output container: " << std::any_cast<const Output &>(getDataReference(OutEdgeID)).size() << std::endl;
+        auto a = getDataReference<Output>(OutEdgeID);
         createNewNode(std::make_unique<UnaryOperationFunctor<Output, Input, FunctionType>>(
-            std::any_cast<Output &>(getDataReference(OutEdgeID)),
-            std::any_cast<const Input &>(getDataReference(InputID)),
+            a,
+            getDataReference<const Input>(InputID),
             Function));
         return OutEdgeID;
     }
@@ -332,7 +334,7 @@ public:
         Edges.push_back(NewEdge);
         auto dataid = DataStorage.size();
         EdgeToDataMapping[edgeid] = dataid;
-        DataStorage[dataid] = std::make_any<DataType>(Data);
+        DataStorage[dataid] = std::make_shared<DataType>(Data);
         return edgeid;
     }
 
@@ -346,7 +348,7 @@ public:
         Edges.push_back(NewEdge);
         auto dataid = DataStorage.size();
         EdgeToDataMapping[edgeid] = dataid;
-        DataStorage[dataid] = std::make_any<ParameterType>(data);
+        DataStorage[dataid] = std::make_shared<ParameterType>(data);
         return edgeid;
     }
 
@@ -357,8 +359,8 @@ public:
             node.Operation->execute();
         }
         std::cout << "finished calc. returning data\n";
-        auto b = std::any_cast<OutputType>(getDataReference(TopEdge));
-        std::cout << "result size: " << b.size() << std::endl;
+        auto b = *getDataReference<OutputType>(TopEdge);
+        std::cout << "result size: " << b.Values.size() << std::endl;
         return b;
     }
 
@@ -384,44 +386,15 @@ public:
     }
 
 private:
-    void performOptimizations()
-    {
-        // perform graph optimizations, such as
-        // - dynamic caching of intermediate edges
-        // - presize all intermediate edges accordingly
-        // - reseat data containers if possible to reduce memory usage (without speed loss)
-        // calculate the mapping between parameter and partial/branch pipelines
-    }
-
-    void createPipelines()
-    {
-        // few things that are important:
-        // 1. we want to shadow graph branches (up to their leaves), which do not have any
-        // non-fixed parameter leaves. Just add a cached node on top of that branch since this
-        // value is always constant during the fit. This has to be optional though, since it might
-        // take to much memory.
-        // 2. when parameters become fixed or non-fixed, different parts of the graph
-        // have to be precalculated and shadowed
-        // 3. the nodes have to be in a hierarchy, so that you know which node has to be calculated
-        // before another etc. This is easy though, since you have all of the connections (edges)
-        // 4. so in the initialization phase, we create a map from changed parameter mask to pipeline
-        // Then we simply have to execute that pipeline when we got a new parameter set
-        // 5. some data might be used in multiple nodes, in that case it would make sense to cache
-        // that cache that data automatically
-        // 6. data which is cached represents the endpoint of one pipeline, and the entrypoint for
-        // new branch pipelines.
-        // 7. a branch pipeline calculates only a certain part of the full graph
-        // (but all of the intermediate datas are temporary)
-    }
-
-    std::any &getDataReference(EdgeID edgeid)
+    template <typename T>
+    std::shared_ptr<T> getDataReference(EdgeID edgeid)
     {
         std::cout << "edgeid: " << edgeid << "\n";
         std::cout << "size mapping: " << EdgeToDataMapping.size() << "\n";
         auto a = EdgeToDataMapping.at(edgeid);
         std::cout << "dataid: " << a << "\n";
         std::cout << "datastorage size: " << DataStorage.size() << std::endl;
-        return DataStorage.at(a);
+        return std::dynamic_pointer_cast<T>(DataStorage.at(a));
     }
 
     void presizeDataContainers(DataID id)
@@ -457,9 +430,9 @@ private:
             }*/
             try
             {
-                auto tempdata = std::any_cast<T>(getDataReference(x));
+                auto tempdata = getDataReference<T>(x);
             }
-            catch (const std::bad_any_cast &e)
+            catch (const std::bad_cast &e)
             {
                 // if this is not the correct type of container, then just keep looking
                 continue;
@@ -474,7 +447,7 @@ private:
         if (!FoundAvailableEdge)
         {
             dataid = DataStorage.size();
-            DataStorage[dataid] = std::make_any<T>();
+            DataStorage[dataid] = std::make_shared<T>();
         }
         EdgeToDataMapping[edgeid] = dataid;
 
@@ -503,7 +476,8 @@ private:
 
     std::vector<FunctionGraphNode> Nodes;
     std::vector<FunctionGraphEdge> Edges;
-    std::map<DataID, std::any> DataStorage;
+    // to reseat data elements, we need shared ptrs
+    std::map<DataID, std::shared_ptr<Tensor>> DataStorage;
     std::map<EdgeID, DataID> EdgeToDataMapping;
     EdgeID TopEdge;
 };
@@ -532,8 +506,8 @@ private:
     FunctionGraph<OutputType> Graph;
 };
 
-// IDEA: I think its best if I leave the VectorizedFunctionGraph simple, and just like a function, that can be evaluated
-// If I want to do fitting I need an estimator, which would wrap/decorate this VectorizedFunctionGraph and do all of the
+// IDEA: I think its best if I leave the FunctionGraph simple, and just like a function, that can be evaluated
+// If I want to do fitting I need an estimator, which would wrap/decorate this FunctionGraph and do all of the
 // create pipelines, parameter changed -> calculate mask, determine which pipeline to run etc...
 // So at this point I have the information about the parameters (if fixed or not). this estimator (decorator) gets the additional function
 // setParameterFitSettings() which sets a parameter fixed or not, then the full parameter set is just reduced to the non fixed ones
@@ -547,24 +521,51 @@ private:
 // IMPORTANT: the mask mentioned above is crucial. So we have a set of branch or partial pipelines, which make up the full graph.
 // Every parameter maps to one of these branch pipelines, this is surjective. With a mask we can determine if a certain partial pipeline
 // should be executed in the next evaluation in an efficient way.
-// TODO: should we turn this into a template specialization??
-/* template <typename OutputType>
-class FunctionGraph : public VectorizedFunctionGraph<OutputType>
+template <typename OutputType>
+class FunctionGraphEvaluator : public Function<OutputType>
 {
 public:
     // this will take a functiongraph and data, and connect everything in a fixed way
-    FunctionGraphEstimator()
+    FunctionGraphEvaluator(FunctionGraph<OutputType> g) : Graph(g)
     {
     }
 
-    createDataEdge() {}
-
-    void attachFunctionGraphToEdge(edgeid id, functiongraph g, datavectors data)
+    void performOptimizations()
     {
-        // get nodes, edges from that graph and incorporate into this graph
+        // perform graph optimizations, such as
+        // - dynamic caching of intermediate edges
+        // - presize all intermediate edges accordingly
+        // - reseat data containers if possible to reduce memory usage (without speed loss)
+        // calculate the mapping between parameter and partial/branch pipelines
     }
 
-    OutputType evaluate() const
+    void createPipelines()
+    {
+        // few things that are important:
+        // 1. we want to shadow graph branches (up to their leaves), which do not have any
+        // non-fixed parameter leaves. Just add a cached node on top of that branch since this
+        // value is always constant during the fit. This has to be optional though, since it might
+        // take to much memory.
+        // 2. when parameters become fixed or non-fixed, different parts of the graph
+        // have to be precalculated and shadowed
+        // 3. the nodes have to be in a hierarchy, so that you know which node has to be calculated
+        // before another etc. This is easy though, since you have all of the connections (edges)
+        // 4. so in the initialization phase, we create a map from changed parameter mask to pipeline
+        // Then we simply have to execute that pipeline when we got a new parameter set
+        // 5. some data might be used in multiple nodes, in that case it would make sense to cache
+        // that cache that data automatically
+        // 6. data which is cached represents the endpoint of one pipeline, and the entrypoint for
+        // new branch pipelines.
+        // 7. a branch pipeline calculates only a certain part of the full graph
+        // (but all of the intermediate datas are temporary)
+    }
+
+    //void attachFunctionGraphToEdge(edgeid id, functiongraph g, datavectors data)
+    //{
+    // get nodes, edges from that graph and incorporate into this graph
+    //}
+
+    OutputType evaluate()
     {
         //Here we do not call the evaluate of the functiongraph
         // then just process the pipelines we created before (depending on which parameters changed)
@@ -584,8 +585,8 @@ public:
     }
 
 private:
-    VectorizedFunctionGraph FunctionGraph;
-}*/
+    FunctionGraph<OutputType> Graph;
+};
 
 int main()
 {
@@ -598,16 +599,16 @@ int main()
     std::uniform_real_distribution<double> di(-100000.0, 100000.0);          //distribution
 
     std::generate(a.begin(), a.end(), [&] { return di(dre); });
-    std::generate(b.begin(), b.end(), [&] { return (int)di(dre); });
+    std::generate(b.begin(), b.end(), [&] { return di(dre); });
 
     typedef std::chrono::duration<long double> MySecondTick;
     MySecondTick sec(0);
     size_t loops(1);
 
-    FunctionGraph<std::vector<double>> g;
+    FunctionGraph<Vector<double>> g;
 
-    auto ida = g.createDataSource<std::vector<double>>(a);
-    auto idb = g.createDataSource<std::vector<double>>(b);
+    auto ida = g.createDataSource(Vector<double>(a));
+    auto idb = g.createDataSource(Vector<double>(b));
 
     auto mycos_wrapper = [](double x) { return std::cos(x); };
     auto myabs_wrapper = [](double x) { return std::abs(x); };
@@ -616,12 +617,12 @@ int main()
     auto blub = ElementWiseUnaryOperation<decltype(mycos_wrapper)>(mycos_wrapper);
     auto asdf = ElementWiseBinaryOperation<decltype(std::multiplies<>())>(std::multiplies<>());
 
-    auto tempres1 = g.addUnaryNode<std::vector<double>, std::vector<double>>(blub, ida);
-    auto myparam = g.createParameterEdge(3.0);
-    auto tempres11 = g.addBinaryNode<std::vector<double>, std::vector<double>, double>(asdf, tempres1, myparam);
-    auto tempres2 = g.addBinaryNode<std::vector<double>, std::vector<double>, std::vector<double>>(asdf, tempres11, idb);
-    auto tempres3 = g.addUnaryNode<std::vector<double>, std::vector<double>>(ElementWiseUnaryOperation<decltype(myabs_wrapper)>(myabs_wrapper), tempres2);
-    auto res = g.addUnaryNode<std::vector<double>, std::vector<double>>(ElementWiseUnaryOperation<decltype(mysqrt_wrapper)>(mysqrt_wrapper), tempres3);
+    auto tempres1 = g.addUnaryNode<Vector<double>, Vector<double>>(blub, ida);
+    auto myparam = g.createParameterEdge(Scalar<double>(3.0));
+    auto tempres11 = g.addBinaryNode<Vector<double>, Vector<double>, Scalar<double>>(asdf, tempres1, myparam);
+    auto tempres2 = g.addBinaryNode<Vector<double>, Vector<double>, Vector<double>>(asdf, tempres11, idb);
+    auto tempres3 = g.addUnaryNode<Vector<double>, Vector<double>>(ElementWiseUnaryOperation<decltype(myabs_wrapper)>(myabs_wrapper), tempres2);
+    auto res = g.addUnaryNode<Vector<double>, Vector<double>>(ElementWiseUnaryOperation<decltype(mysqrt_wrapper)>(mysqrt_wrapper), tempres3);
 
     //g.fillDataContainers({a, b});
 
@@ -630,7 +631,7 @@ int main()
         std::chrono::steady_clock::time_point StartTime =
             std::chrono::steady_clock::now();
 
-        auto result = g.evaluate();
+        auto result = g.evaluate().Values;
 
         std::chrono::steady_clock::time_point EndTime =
             std::chrono::steady_clock::now();
